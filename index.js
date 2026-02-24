@@ -10,7 +10,6 @@ const USER_TOKEN = process.env.USER_TOKEN;
 const SOURCE_GUILD_ID = process.env.SOURCE_GUILD_ID;
 const TARGET_GUILD_ID = process.env.TARGET_GUILD_ID;
 const SOURCE_CATEGORY_ID = process.env.SOURCE_CATEGORY_ID;
-const TARGET_CHANNEL_ID = process.env.TARGET_CHANNEL_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
 
 // Opzioni
@@ -34,7 +33,8 @@ const stateSchema = new mongoose.Schema({
     type: Map,
     of: new mongoose.Schema({
       completed: Boolean,
-      lastProcessedMessageId: String
+      lastProcessedMessageId: String,
+      targetChannelId: String   // ID del canale creato nel server target
     }, { _id: false })
   },
   videoCounter: Number
@@ -44,9 +44,14 @@ const State = mongoose.model('State', stateSchema);
 
 async function saveState(guildId, categoryId, channelsMap, videoCounter) {
   try {
+    // Converti la Map in un oggetto plain per MongoDB
+    const plainChannels = {};
+    for (const [key, value] of channelsMap.entries()) {
+      plainChannels[key] = value;
+    }
     await State.findOneAndUpdate(
       { guildId, categoryId },
-      { channels: channelsMap, videoCounter },
+      { channels: plainChannels, videoCounter },
       { upsert: true }
     );
     console.log('💾 Stato salvato su MongoDB');
@@ -57,7 +62,13 @@ async function saveState(guildId, categoryId, channelsMap, videoCounter) {
 
 async function loadState(guildId, categoryId) {
   try {
-    return await State.findOne({ guildId, categoryId });
+    const doc = await State.findOne({ guildId, categoryId });
+    if (doc) {
+      // Ricostruisci la Map
+      const channelsMap = new Map(Object.entries(doc.channels || {}));
+      return { channels: channelsMap, videoCounter: doc.videoCounter };
+    }
+    return null;
   } catch (err) {
     console.error('❌ Errore caricamento stato:', err.message);
     return null;
@@ -96,7 +107,34 @@ async function sendFileWithRetry(channel, filePath, retries = MAX_RETRIES) {
   }
 }
 
-async function cloneMedia(sourceGuild, targetChannel, state) {
+async function getOrCreateTargetChannel(targetGuild, sourceChannelName, sourceChannelId, channelsState) {
+  // Se abbiamo già un ID salvato per questo canale, proviamo a recuperarlo
+  const existing = channelsState.get(sourceChannelId);
+  if (existing && existing.targetChannelId) {
+    const cachedChannel = targetGuild.channels.cache.get(existing.targetChannelId);
+    if (cachedChannel) return cachedChannel;
+  }
+
+  // Cerca un canale con lo stesso nome (case sensitive)
+  let targetChannel = targetGuild.channels.cache.find(c => c.name === sourceChannelName && c.type === 'GUILD_TEXT');
+  if (!targetChannel) {
+    // Crea un nuovo canale testuale
+    console.log(`➕ Creazione canale #${sourceChannelName} nel server target...`);
+    targetChannel = await targetGuild.channels.create(sourceChannelName, {
+      type: 'GUILD_TEXT',
+      reason: 'Creato per clonazione media'
+    });
+    // Attendi un po' per evitare rate limit
+    await new Promise(r => setTimeout(r, 2000));
+  } else {
+    console.log(`🔁 Canale #${sourceChannelName} già esistente, verrà utilizzato.`);
+  }
+
+  // Salva l'ID nello stato
+  return targetChannel;
+}
+
+async function cloneMedia(sourceGuild, targetGuild, state) {
   console.log(`🔍 Cerco categoria ${SOURCE_CATEGORY_ID}`);
   const category = sourceGuild.channels.cache.get(SOURCE_CATEGORY_ID);
   if (!category || category.type !== 'GUILD_CATEGORY') {
@@ -109,18 +147,25 @@ async function cloneMedia(sourceGuild, targetChannel, state) {
 
   let totalFiles = 0;
   let videoCounter = state?.videoCounter || 1;
-  let channelsState = state?.channels ? new Map(Object.entries(state.channels)) : new Map();
+  let channelsState = state?.channels || new Map();
 
-  for (const channel of textChannels.values()) {
-    const channelId = channel.id;
-    let channelData = channelsState.get(channelId) || { completed: false };
+  for (const sourceChannel of textChannels.values()) {
+    const sourceChannelId = sourceChannel.id;
+    let channelData = channelsState.get(sourceChannelId) || { completed: false };
 
     if (channelData.completed) {
-      console.log(`⏭️ Canale #${channel.name} già completato, salto.`);
+      console.log(`⏭️ Canale #${sourceChannel.name} già completato, salto.`);
       continue;
     }
 
-    console.log(`\n📨 Elaborazione canale #${channel.name} (${channelId})`);
+    console.log(`\n📨 Elaborazione canale #${sourceChannel.name} (${sourceChannelId})`);
+
+    // Ottieni o crea il canale target corrispondente
+    const targetChannel = await getOrCreateTargetChannel(targetGuild, sourceChannel.name, sourceChannelId, channelsState);
+    // Aggiorna lo stato con l'ID del canale target
+    channelData.targetChannelId = targetChannel.id;
+    channelsState.set(sourceChannelId, channelData);
+    await saveState(sourceGuild.id, category.id, channelsState, videoCounter);
 
     try {
       let options = { limit: 100 };
@@ -133,7 +178,7 @@ async function cloneMedia(sourceGuild, targetChannel, state) {
       let done = false;
 
       while (!done) {
-        const messages = await channel.messages.fetch(options).catch(err => {
+        const messages = await sourceChannel.messages.fetch(options).catch(err => {
           console.error(`Errore fetch messaggi: ${err.message}`);
           return null;
         });
@@ -173,9 +218,10 @@ async function cloneMedia(sourceGuild, targetChannel, state) {
             await new Promise(r => setTimeout(r, SLEEP_MS));
           }
 
+          // Aggiorna l'ultimo messaggio processato
           channelData.lastProcessedMessageId = message.id;
-          channelsState.set(channelId, channelData);
-          await saveState(sourceGuild.id, category.id, Object.fromEntries(channelsState), videoCounter);
+          channelsState.set(sourceChannelId, channelData);
+          await saveState(sourceGuild.id, category.id, channelsState, videoCounter);
         }
 
         fetchedMessages += messages.size;
@@ -193,24 +239,27 @@ async function cloneMedia(sourceGuild, targetChannel, state) {
         }
       }
 
+      // Segna il canale come completato
       channelData.completed = true;
-      channelsState.set(channelId, channelData);
-      await saveState(sourceGuild.id, category.id, Object.fromEntries(channelsState), videoCounter);
-      console.log(`✅ Canale #${channel.name} completato.`);
+      channelsState.set(sourceChannelId, channelData);
+      await saveState(sourceGuild.id, category.id, channelsState, videoCounter);
+      console.log(`✅ Canale #${sourceChannel.name} completato.`);
 
     } catch (err) {
-      console.error(`❌ Errore grave nel canale #${channel.name}:`, err.message);
-      await saveState(sourceGuild.id, category.id, Object.fromEntries(channelsState), videoCounter);
+      console.error(`❌ Errore grave nel canale #${sourceChannel.name}:`, err.message);
+      await saveState(sourceGuild.id, category.id, channelsState, videoCounter);
     }
   }
 
   console.log(`\n✅ Clonazione completata! Totale file trasferiti: ${totalFiles}`);
 }
 
+// ---------- Server HTTP fittizio per Render ----------
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('Self‑bot con checkpoint MongoDB'));
+app.get('/', (req, res) => res.send('Self‑bot con checkpoint MongoDB e creazione canali'));
 app.listen(PORT, () => console.log(`🌐 Server HTTP su porta ${PORT}`));
+// ------------------------------------------------------
 
 client.on('ready', async () => {
   if (isRunning) return;
@@ -218,6 +267,7 @@ client.on('ready', async () => {
 
   console.log(`✅ Self‑bot connesso come ${client.user.tag}`);
 
+  // Connessione a MongoDB con retry
   let connected = false;
   for (let i = 0; i < 5; i++) {
     try {
@@ -242,12 +292,7 @@ client.on('ready', async () => {
     return;
   }
 
-  const targetChannel = targetGuild.channels.cache.get(TARGET_CHANNEL_ID);
-  if (!targetChannel || targetChannel.type !== 'GUILD_TEXT') {
-    console.error('❌ Canale destinazione non valido.');
-    return;
-  }
-
+  // Carica lo stato
   const state = await loadState(sourceGuild.id, SOURCE_CATEGORY_ID);
   if (state) {
     console.log('🔄 Stato precedente caricato, riprendo da dove ero rimasto.');
@@ -255,7 +300,7 @@ client.on('ready', async () => {
     console.log('🆕 Nessuno stato precedente, parto dall\'inizio.');
   }
 
-  await cloneMedia(sourceGuild, targetChannel, state);
+  await cloneMedia(sourceGuild, targetGuild, state);
   console.log('🏁 Operazione terminata. Il self‑bot rimane in esecuzione.');
 });
 

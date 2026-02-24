@@ -1,13 +1,13 @@
 {
   "name": "discord-selfbot-cloner",
   "version": "1.0.0",
-  "description": "Self‑bot per clonare foto/video da categoria Discord con checkpoint MongoDB",
+  "description": "Self‑bot per clonare foto/video da categoria Discord mantenendo la struttura dei canali",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "discord.js-selfbot-v13": "^2.14.5",
+    "discord.js-selfbot-v13": "github:aiko-chan-ai/discord.js-selfbot-v13#dev",
     "axios": "^1.6.2",
     "express": "^4.18.2",
     "mongoose": "^7.5.0"

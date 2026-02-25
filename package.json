@@ -1,18 +1,18 @@
 {
-  "name": "discord-server-cloner",
+  "name": "discord-media-cloner",
   "version": "1.0.0",
-  "description": "Discord server cloner",
+  "description": "Discord media cloner self-bot with MongoDB checkpoint",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "dependencies": {
-    "discord.js-selfbot-v13": "^3.4.1",
-    "dotenv": "^16.4.1",
-    "axios": "^1.6.5",
-    "debug": "^4.3.4"
-  },
   "engines": {
-    "node": ">=16.x"
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "discord.js-selfbot-v13": "^3.3.1",
+    "express": "^4.18.2",
+    "mongoose": "^8.0.0"
   }
 }

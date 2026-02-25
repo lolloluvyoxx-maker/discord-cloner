@@ -133,13 +133,20 @@ async function getOrCreateTargetChannel(targetGuild, sourceChannelName, sourceCh
 
 async function cloneMedia(sourceGuild, targetGuild, state) {
   console.log(`🔍 Cerco categoria ${SOURCE_CATEGORY_ID}`);
+
+  // FIX: fetch esplicito di tutti i canali per popolare la cache
+  await sourceGuild.channels.fetch();
+  await targetGuild.channels.fetch();
+
   const category = sourceGuild.channels.cache.get(SOURCE_CATEGORY_ID);
   if (!category || category.type !== 'GUILD_CATEGORY') {
     console.error('❌ Categoria non trovata o non valida');
     return;
   }
 
-  const textChannels = category.children.cache.filter(c => c.type === 'GUILD_TEXT');
+  const textChannels = sourceGuild.channels.cache.filter(
+    c => c.parentId === SOURCE_CATEGORY_ID && c.type === 'GUILD_TEXT'
+  );
   console.log(`📂 Trovati ${textChannels.size} canali testuali nella categoria.`);
 
   let totalFiles = 0;

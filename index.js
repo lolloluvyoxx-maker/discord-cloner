@@ -195,7 +195,15 @@ async function cloneMedia(sourceGuild, targetGuild, state) {
 
         for (const message of sortedMessages) {
           if (message.attachments.size) {
-            for (const attachment of message.attachments.values()) {
+            // FIX: ri-fetcha il messaggio per ottenere URL freschi (evita 401 Unauthorized)
+            let freshMessage = message;
+            try {
+              freshMessage = await sourceChannel.messages.fetch(message.id);
+            } catch (err) {
+              console.log(`⚠️ Impossibile ri-fetchare il messaggio ${message.id}, uso URL originale`);
+            }
+
+            for (const attachment of freshMessage.attachments.values()) {
               const ext = path.extname(attachment.name).toLowerCase();
               const isImage = IMAGE_EXTS.includes(ext);
               const isVideo = VIDEO_EXTS.includes(ext);
@@ -214,7 +222,17 @@ async function cloneMedia(sourceGuild, targetGuild, state) {
 
               try {
                 await downloadFile(attachment.url, tempPath);
-                console.log(`⬆️ Invio a #${targetChannel.name}`);
+
+                // FIX: verifica che il file scaricato sia valido e non vuoto/corrotto
+                const stats = fs.statSync(tempPath);
+                if (stats.size < 1024) {
+                  // File troppo piccolo = URL scaduto, ha scaricato una pagina di errore
+                  console.log(`⚠️ File ${attachment.name} corrotto o URL scaduto (${stats.size} bytes), salto.`);
+                  fs.unlinkSync(tempPath);
+                  continue;
+                }
+
+                console.log(`⬆️ Invio a #${targetChannel.name} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
                 await sendFileWithRetry(targetChannel, tempPath);
                 fs.unlinkSync(tempPath);
                 totalFiles++;
@@ -335,4 +353,4 @@ client.login(USER_TOKEN).catch(err => {
   console.error('❌ Errore di login:', err.message);
   process.exit(1);
 });
-      
+                                

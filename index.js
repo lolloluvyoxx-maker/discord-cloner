@@ -1,292 +1,233 @@
 const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
+const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
-const mongoose = require('mongoose');
 
 // ==================== CONFIGURAZIONE ====================
 const USER_TOKEN = process.env.USER_TOKEN;
 const SOURCE_GUILD_ID = process.env.SOURCE_GUILD_ID;
 const TARGET_GUILD_ID = process.env.TARGET_GUILD_ID;
 const SOURCE_CATEGORY_ID = process.env.SOURCE_CATEGORY_ID;
-const MONGODB_URI = process.env.MONGODB_URI;
 
-// Opzioni
 const RENAME_VIDEOS = true;
 const VIDEO_NAME = 'SENSATIONAL';
 const IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'];
 const VIDEO_EXTS = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv'];
-const MAX_MESSAGES = null;           // null = tutti i messaggi
-const SLEEP_MS = 1200;               // pausa tra operazioni (ms)
-const MAX_RETRIES = 3;               // tentativi di download/upload
+const MAX_FILE_SIZE_MB = 25;
+const SLEEP_MS = 800;
+const MAX_RETRIES = 3;
+const FILES_PER_MESSAGE = 2; // invia N file per messaggio webhook
 // =========================================================
 
 const client = new Client();
 let isRunning = false;
 
-// ------------------ MODELLO MONGOOSE ------------------
-const stateSchema = new mongoose.Schema({
-  guildId: String,
-  categoryId: String,
-  channels: {
-    type: Map,
-    of: new mongoose.Schema({
-      completed: Boolean,
-      lastProcessedMessageId: String,
-      targetChannelId: String
-    }, { _id: false })
-  },
-  videoCounter: Number
-});
-const State = mongoose.model('State', stateSchema);
-// --------------------------------------------------------
-
-async function saveState(guildId, categoryId, channelsMap, videoCounter) {
-  try {
-    const plainChannels = {};
-    for (const [key, value] of channelsMap.entries()) {
-      plainChannels[key] = value;
-    }
-    await State.findOneAndUpdate(
-      { guildId, categoryId },
-      { channels: plainChannels, videoCounter },
-      { upsert: true, new: true }
-    );
-    console.log('💾 Stato salvato su MongoDB');
-  } catch (err) {
-    console.error('❌ Errore salvataggio stato:', err.message);
-  }
+// Contatore video globale con mutex per evitare duplicati tra canali paralleli
+let videoCounter = 1;
+function getNextVideoCounter() {
+  return videoCounter++;
 }
 
-async function loadState(guildId, categoryId) {
-  try {
-    const doc = await State.findOne({ guildId, categoryId });
-    if (doc) {
-      const channelsMap = new Map(Object.entries(doc.channels || {}));
-      return { channels: channelsMap, videoCounter: doc.videoCounter };
-    }
-    return null;
-  } catch (err) {
-    console.error('❌ Errore caricamento stato:', err.message);
-    return null;
-  }
+async function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 async function downloadFile(url, outputPath, retries = MAX_RETRIES) {
   for (let i = 0; i < retries; i++) {
     try {
       const writer = fs.createWriteStream(outputPath);
-      const response = await axios({ url, method: 'GET', responseType: 'stream', timeout: 30000 });
+      const response = await axios({ url, method: 'GET', responseType: 'stream', timeout: 60000 });
       response.data.pipe(writer);
       await new Promise((resolve, reject) => {
         writer.on('finish', resolve);
         writer.on('error', reject);
       });
-      return true;
+      const stats = fs.statSync(outputPath);
+      if (stats.size < 1024) {
+        fs.unlinkSync(outputPath);
+        throw new Error('URL scaduto o file corrotto');
+      }
+      return stats.size;
     } catch (err) {
-      console.log(`⏳ Tentativo ${i + 1} fallito per ${url}, riprovo...`);
+      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
       if (i === retries - 1) throw err;
-      await new Promise(r => setTimeout(r, 5000));
+      await sleep(3000);
     }
   }
 }
 
-async function sendFileWithRetry(channel, filePath, retries = MAX_RETRIES) {
+// Invia fino a FILES_PER_MESSAGE file in un solo messaggio webhook
+async function sendPairViaWebhook(webhookUrl, filePaths, retries = MAX_RETRIES) {
   for (let i = 0; i < retries; i++) {
     try {
-      await channel.send({ files: [filePath] });
+      const form = new FormData();
+      filePaths.forEach((fp, idx) => {
+        form.append(`files[${idx}]`, fs.createReadStream(fp));
+      });
+      await axios.post(webhookUrl, form, {
+        headers: form.getHeaders(),
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        timeout: 60000
+      });
       return true;
     } catch (err) {
-      console.log(`⏳ Invio fallito (tentativo ${i + 1}), riprovo...`);
       if (i === retries - 1) throw err;
-      await new Promise(r => setTimeout(r, 5000));
+      await sleep(3000);
     }
   }
 }
 
-async function getOrCreateTargetChannel(targetGuild, sourceChannelName, sourceChannelId, channelsState) {
-  const existing = channelsState.get(sourceChannelId);
-
-  if (existing && existing.targetChannelId) {
-    const cachedChannel = targetGuild.channels.cache.get(existing.targetChannelId);
-    if (cachedChannel) return cachedChannel;
+async function getOrCreateWebhook(targetChannel) {
+  const webhooks = await targetChannel.fetchWebhooks();
+  let webhook = webhooks.find(w => w.name === 'MediaCloner');
+  if (!webhook) {
+    webhook = await targetChannel.createWebhook('MediaCloner', { reason: 'Clonazione media' });
+    await sleep(500);
   }
-
-  let targetChannel = targetGuild.channels.cache.find(
-    c => c.name === sourceChannelName && c.type === 'GUILD_TEXT'
-  );
-
-  if (!targetChannel) {
-    console.log(`➕ Creazione canale #${sourceChannelName} nel server target...`);
-    targetChannel = await targetGuild.channels.create(sourceChannelName, {
-      type: 'GUILD_TEXT',
-      reason: 'Creato per clonazione media'
-    });
-    await new Promise(r => setTimeout(r, 2000));
-  } else {
-    console.log(`🔁 Canale #${sourceChannelName} già esistente, verrà utilizzato.`);
-  }
-
-  return targetChannel;
+  return webhook.url;
 }
 
-async function cloneMedia(sourceGuild, targetGuild, state) {
-  console.log(`🔍 Cerco categoria ${SOURCE_CATEGORY_ID}`);
+async function getOrCreateTargetChannel(targetGuild, name) {
+  let ch = targetGuild.channels.cache.find(c => c.name === name && c.type === 'GUILD_TEXT');
+  if (!ch) {
+    ch = await targetGuild.channels.create(name, { type: 'GUILD_TEXT' });
+    await sleep(1500);
+  }
+  return ch;
+}
 
-  // FIX: fetch esplicito di tutti i canali per popolare la cache
+// Processa un singolo canale: scarica e invia a coppie
+async function processChannel(sourceChannel, targetGuild) {
+  console.log(`\n📨 [#${sourceChannel.name}] Avvio elaborazione...`);
+
+  const targetChannel = await getOrCreateTargetChannel(targetGuild, sourceChannel.name);
+  const webhookUrl = await getOrCreateWebhook(targetChannel);
+
+  let afterId = '0';
+  let done = false;
+  let buffer = []; // buffer di file scaricati pronti per l'invio
+  let channelFiles = 0;
+
+  while (!done) {
+    const messages = await sourceChannel.messages.fetch({ limit: 100, after: afterId }).catch(() => null);
+    if (!messages || messages.size === 0) break;
+
+    const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+    for (const message of sorted) {
+      if (message.attachments.size) {
+        let freshMessage = message;
+        try { freshMessage = await sourceChannel.messages.fetch(message.id); } catch (_) {}
+
+        for (const attachment of freshMessage.attachments.values()) {
+          const ext = path.extname(attachment.name).toLowerCase();
+          const isImage = IMAGE_EXTS.includes(ext);
+          const isVideo = VIDEO_EXTS.includes(ext);
+          if (!isImage && !isVideo) continue;
+
+          if (attachment.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
+            console.log(`[#${sourceChannel.name}] ⚠️ Salto ${attachment.name} (${(attachment.size / 1024 / 1024).toFixed(1)}MB)`);
+            continue;
+          }
+
+          let newFileName;
+          if (isVideo && RENAME_VIDEOS) {
+            const n = getNextVideoCounter();
+            newFileName = `${VIDEO_NAME}_${n}${ext}`;
+          } else {
+            newFileName = attachment.name;
+          }
+
+          // Aggiungi prefisso canale al nome per evitare collisioni tra canali paralleli
+          const tempPath = path.join(__dirname, `${sourceChannel.id}_${newFileName}`);
+          console.log(`[#${sourceChannel.name}] ⬇️ ${attachment.name} -> ${newFileName}`);
+
+          try {
+            await downloadFile(attachment.url, tempPath);
+            buffer.push({ tempPath, newFileName });
+
+            // Quando il buffer è pieno, invia la coppia
+            if (buffer.length >= FILES_PER_MESSAGE) {
+              const pair = buffer.splice(0, FILES_PER_MESSAGE);
+              const paths = pair.map(f => f.tempPath);
+              const names = pair.map(f => f.newFileName).join(', ');
+              console.log(`[#${sourceChannel.name}] ⬆️ Invio coppia: ${names}`);
+              try {
+                await sendPairViaWebhook(webhookUrl, paths);
+                channelFiles += pair.length;
+                console.log(`[#${sourceChannel.name}] ✅ Inviati: ${names}`);
+              } catch (err) {
+                console.error(`[#${sourceChannel.name}] ❌ Invio coppia fallito: ${err.message}`);
+              }
+              paths.forEach(p => { if (fs.existsSync(p)) fs.unlinkSync(p); });
+              await sleep(SLEEP_MS);
+            }
+          } catch (err) {
+            console.error(`[#${sourceChannel.name}] ❌ Download fallito: ${attachment.name}: ${err.message}`);
+            if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+          }
+        }
+      }
+      afterId = message.id;
+    }
+
+    if (messages.size < 100) done = true;
+    else await sleep(SLEEP_MS);
+  }
+
+  // Invia eventuali file rimasti nel buffer (dispari)
+  if (buffer.length > 0) {
+    const paths = buffer.map(f => f.tempPath);
+    const names = buffer.map(f => f.newFileName).join(', ');
+    console.log(`[#${sourceChannel.name}] ⬆️ Invio rimanenti: ${names}`);
+    try {
+      await sendPairViaWebhook(webhookUrl, paths);
+      channelFiles += buffer.length;
+      console.log(`[#${sourceChannel.name}] ✅ Inviati: ${names}`);
+    } catch (err) {
+      console.error(`[#${sourceChannel.name}] ❌ Invio rimanenti fallito: ${err.message}`);
+    }
+    paths.forEach(p => { if (fs.existsSync(p)) fs.unlinkSync(p); });
+  }
+
+  console.log(`[#${sourceChannel.name}] ✅ Completato! File inviati: ${channelFiles}`);
+  return channelFiles;
+}
+
+async function cloneMedia(sourceGuild, targetGuild) {
   await sourceGuild.channels.fetch();
   await targetGuild.channels.fetch();
 
   const category = sourceGuild.channels.cache.get(SOURCE_CATEGORY_ID);
   if (!category || category.type !== 'GUILD_CATEGORY') {
-    console.error('❌ Categoria non trovata o non valida');
+    console.error('❌ Categoria non trovata');
     return;
   }
 
   const textChannels = sourceGuild.channels.cache.filter(
     c => c.parentId === SOURCE_CATEGORY_ID && c.type === 'GUILD_TEXT'
   );
-  console.log(`📂 Trovati ${textChannels.size} canali testuali nella categoria.`);
+  console.log(`📂 Trovati ${textChannels.size} canali — avvio in parallelo!`);
 
-  let totalFiles = 0;
-  let videoCounter = state?.videoCounter || 1;
-  let channelsState = state?.channels || new Map();
+  // Lancia tutti i canali in parallelo
+  const results = await Promise.allSettled(
+    [...textChannels.values()].map(ch => processChannel(ch, targetGuild))
+  );
 
-  for (const sourceChannel of textChannels.values()) {
-    const sourceChannelId = sourceChannel.id;
-    let channelData = channelsState.get(sourceChannelId) || { completed: false };
-
-    if (channelData.completed) {
-      console.log(`⏭️ Canale #${sourceChannel.name} già completato, salto.`);
-      continue;
-    }
-
-    console.log(`\n📨 Elaborazione canale #${sourceChannel.name} (${sourceChannelId})`);
-
-    const targetChannel = await getOrCreateTargetChannel(
-      targetGuild, sourceChannel.name, sourceChannelId, channelsState
-    );
-
-    channelData.targetChannelId = targetChannel.id;
-    channelsState.set(sourceChannelId, channelData);
-    await saveState(sourceGuild.id, category.id, channelsState, videoCounter);
-
-    try {
-      let fetchedMessages = 0;
-      let done = false;
-      let afterId = channelData.lastProcessedMessageId || '0';
-
-      if (channelData.lastProcessedMessageId) {
-        console.log(`🔄 Riprendo dal messaggio successivo a ${channelData.lastProcessedMessageId}`);
-      }
-
-      while (!done) {
-        const options = { limit: 100, after: afterId };
-
-        const messages = await sourceChannel.messages.fetch(options).catch(err => {
-          console.error(`Errore fetch messaggi: ${err.message}`);
-          return null;
-        });
-
-        if (!messages || messages.size === 0) break;
-
-        const sortedMessages = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-
-        for (const message of sortedMessages) {
-          if (message.attachments.size) {
-            // FIX: ri-fetcha il messaggio per ottenere URL freschi (evita 401 Unauthorized)
-            let freshMessage = message;
-            try {
-              freshMessage = await sourceChannel.messages.fetch(message.id);
-            } catch (err) {
-              console.log(`⚠️ Impossibile ri-fetchare il messaggio ${message.id}, uso URL originale`);
-            }
-
-            for (const attachment of freshMessage.attachments.values()) {
-              const ext = path.extname(attachment.name).toLowerCase();
-              const isImage = IMAGE_EXTS.includes(ext);
-              const isVideo = VIDEO_EXTS.includes(ext);
-              if (!isImage && !isVideo) continue;
-
-              let newFileName;
-              if (isVideo && RENAME_VIDEOS) {
-                newFileName = `${VIDEO_NAME}_${videoCounter}${ext}`;
-                videoCounter++;
-              } else {
-                newFileName = attachment.name;
-              }
-
-              console.log(`⬇️ Scaricamento: ${attachment.name} -> ${newFileName}`);
-              const tempPath = path.join(__dirname, newFileName);
-
-              try {
-                await downloadFile(attachment.url, tempPath);
-
-                // FIX: verifica che il file scaricato sia valido e non vuoto/corrotto
-                const stats = fs.statSync(tempPath);
-                if (stats.size < 1024) {
-                  // File troppo piccolo = URL scaduto, ha scaricato una pagina di errore
-                  console.log(`⚠️ File ${attachment.name} corrotto o URL scaduto (${stats.size} bytes), salto.`);
-                  fs.unlinkSync(tempPath);
-                  continue;
-                }
-
-                console.log(`⬆️ Invio a #${targetChannel.name} (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
-                await sendFileWithRetry(targetChannel, tempPath);
-                fs.unlinkSync(tempPath);
-                totalFiles++;
-              } catch (err) {
-                console.error(`❌ Fallimento definitivo per ${attachment.name}:`, err.message);
-                if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-              }
-
-              await new Promise(r => setTimeout(r, SLEEP_MS));
-            }
-          }
-
-          channelData.lastProcessedMessageId = message.id;
-          afterId = message.id;
-          channelsState.set(sourceChannelId, channelData);
-        }
-
-        await saveState(sourceGuild.id, category.id, channelsState, videoCounter);
-
-        fetchedMessages += messages.size;
-        if (MAX_MESSAGES && fetchedMessages >= MAX_MESSAGES) {
-          console.log(`⚠️ Raggiunto limite di ${MAX_MESSAGES} messaggi per questo canale.`);
-          done = true;
-          break;
-        }
-
-        if (messages.size < 100) {
-          done = true;
-        } else {
-          await new Promise(r => setTimeout(r, SLEEP_MS));
-        }
-      }
-
-      channelData.completed = true;
-      channelsState.set(sourceChannelId, channelData);
-      await saveState(sourceGuild.id, category.id, channelsState, videoCounter);
-      console.log(`✅ Canale #${sourceChannel.name} completato.`);
-
-    } catch (err) {
-      console.error(`❌ Errore grave nel canale #${sourceChannel.name}:`, err.message);
-      await saveState(sourceGuild.id, category.id, channelsState, videoCounter);
-    }
-  }
-
-  console.log(`\n✅ Clonazione completata! Totale file trasferiti: ${totalFiles}`);
+  const totalFiles = results.reduce((sum, r) => sum + (r.status === 'fulfilled' ? r.value : 0), 0);
+  console.log(`\n🏁 Fine! Totale file inviati: ${totalFiles}`);
 }
 
-// ---------- Server HTTP per Render (obbligatorio per mantenere il servizio attivo) ----------
+// ---------- Server HTTP per Render ----------
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('✅ Self-bot attivo'));
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 app.listen(PORT, () => console.log(`🌐 Server HTTP in ascolto sulla porta ${PORT}`));
-// --------------------------------------------------------------------------------------------
+// --------------------------------------------
 
 client.on('ready', async () => {
   if (isRunning) return;
@@ -294,63 +235,22 @@ client.on('ready', async () => {
 
   console.log(`✅ Self-bot connesso come ${client.user.tag}`);
 
-  // Verifica variabili d'ambiente obbligatorie
-  const required = { USER_TOKEN, SOURCE_GUILD_ID, TARGET_GUILD_ID, SOURCE_CATEGORY_ID, MONGODB_URI };
-  for (const [key, val] of Object.entries(required)) {
-    if (!val) {
-      console.error(`❌ Variabile d'ambiente mancante: ${key}`);
-      process.exit(1);
-    }
-  }
-
-  let connected = false;
-  for (let i = 0; i < 5; i++) {
-    try {
-      await mongoose.connect(MONGODB_URI);
-      connected = true;
-      console.log('📦 Connesso a MongoDB');
-      break;
-    } catch (err) {
-      console.log(`⏳ Connessione MongoDB fallita (tentativo ${i + 1}/5):`, err.message);
-      await new Promise(r => setTimeout(r, 10000));
-    }
-  }
-
-  if (!connected) {
-    console.error('❌ Impossibile connettersi a MongoDB, esco.');
-    process.exit(1);
-  }
-
   const sourceGuild = client.guilds.cache.get(SOURCE_GUILD_ID);
   const targetGuild = client.guilds.cache.get(TARGET_GUILD_ID);
   if (!sourceGuild || !targetGuild) {
-    console.error('❌ Server non trovati. Controlla SOURCE_GUILD_ID e TARGET_GUILD_ID');
+    console.error('❌ Server non trovati.');
     process.exit(1);
   }
 
-  const state = await loadState(sourceGuild.id, SOURCE_CATEGORY_ID);
-  if (state) {
-    console.log('🔄 Stato precedente caricato, riprendo da dove ero rimasto.');
-  } else {
-    console.log("🆕 Nessuno stato precedente, parto dall'inizio.");
-  }
-
-  await cloneMedia(sourceGuild, targetGuild, state);
-
-  await mongoose.disconnect();
-  console.log('🏁 Operazione terminata. Il server HTTP rimane attivo.');
+  await cloneMedia(sourceGuild, targetGuild);
+  console.log('🏁 Operazione terminata.');
 });
 
-// Gestione errori non catturati per evitare crash del container Render
-process.on('unhandledRejection', (reason) => {
-  console.error('❌ Unhandled Rejection:', reason);
-});
-process.on('uncaughtException', (err) => {
-  console.error('❌ Uncaught Exception:', err.message);
-});
+process.on('unhandledRejection', reason => console.error('❌ Unhandled:', reason));
+process.on('uncaughtException', err => console.error('❌ Exception:', err.message));
 
 client.login(USER_TOKEN).catch(err => {
-  console.error('❌ Errore di login:', err.message);
+  console.error('❌ Login fallito:', err.message);
   process.exit(1);
 });
-                                
+          
